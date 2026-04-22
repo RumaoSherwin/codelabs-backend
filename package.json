@@ -1,0 +1,19 @@
+{
+  "name": "browser-ide-backend",
+  "version": "1.0.0",
+  "description": "Production-ready Express and WebSocket backend for Railway browser IDE sessions.",
+  "main": "server.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.3"
+  }
+}
