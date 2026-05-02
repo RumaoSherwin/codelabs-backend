@@ -4,6 +4,9 @@ const http = require("http");
 const { spawn, spawnSync } = require("child_process");
 const { randomUUID } = require("crypto");
 const { WebSocketServer } = require("ws");
+const fs = require("fs/promises");
+const os = require("os");
+const path = require("path");
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = "0.0.0.0";
@@ -20,6 +23,23 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || "*")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const CODELAB_LANGUAGE_MAP = {
+  c: "c",
+  cpp: "cpp",
+  csharp: "csharp",
+  go: "go",
+  java: "java",
+  javascript: "javascript",
+  js: "javascript",
+  node: "javascript",
+  python: "python3",
+  python3: "python3",
+  rust: "rust",
+  typescript: "typescript",
+  ts: "typescript",
+};
+
+const TSC_COMMAND = path.join(process.cwd(), "node_modules", "typescript", "bin", "tsc");
 
 const PYTHON_WORKER = String.raw`
 import contextlib
@@ -218,8 +238,31 @@ function detectPythonCommand() {
   return null;
 }
 
+function detectCommand(candidates) {
+  for (const candidate of candidates) {
+    const result = spawnSync(candidate, ["--version"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+
+    if (!result.error && result.status === 0) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 const PYTHON_COMMAND = detectPythonCommand();
 const NODE_COMMAND = process.execPath;
+const GCC_COMMAND = detectCommand(["gcc"]);
+const GPP_COMMAND = detectCommand(["g++"]);
+const GO_COMMAND = detectCommand(["go"]);
+const JAVAC_COMMAND = detectCommand(["javac"]);
+const JAVA_COMMAND = detectCommand(["java"]);
+const MCS_COMMAND = detectCommand(["mcs"]);
+const MONO_COMMAND = detectCommand(["mono"]);
+const RUSTC_COMMAND = detectCommand(["rustc"]);
 const sessions = new Map();
 
 function createLineParser(onMessage) {
@@ -485,6 +528,220 @@ function createSession(language) {
   return session;
 }
 
+function sanitizeJavaClassName(code) {
+  const publicMatch = code.match(/\bpublic\s+class\s+([A-Za-z_]\w*)/);
+  if (publicMatch) return publicMatch[1];
+  const classMatch = code.match(/\bclass\s+([A-Za-z_]\w*)/);
+  if (classMatch) return classMatch[1];
+  return "Main";
+}
+
+function spawnProcess(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env ? { ...process.env, ...options.env } : process.env,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      }, 1500).unref();
+    }, options.timeoutMs || RUN_TIMEOUT_MS);
+    timeout.unref();
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+
+      if (timedOut) {
+        reject(Object.assign(new Error("Execution timed out"), { stdout, stderr }));
+        return;
+      }
+
+      resolve({
+        code: typeof code === "number" ? code : 1,
+        stdout,
+        stderr,
+      });
+    });
+
+    if (options.input) {
+      child.stdin.write(options.input);
+    }
+    child.stdin.end();
+  });
+}
+
+async function withTempWorkspace(fn) {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "sifra-run-"));
+  try {
+    return await fn(workspace);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function ensureRuntime(command, label) {
+  if (command) return command;
+  throw Object.assign(new Error(`${label} is not installed in this container`), { statusCode: 500 });
+}
+
+async function runNativeProgram(language, code, input = "") {
+  if (language === "javascript") {
+    const result = await spawnProcess(NODE_COMMAND, ["-e", code], { input });
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      status: result.code === 0 ? "completed" : "error",
+    };
+  }
+
+  if (language === "python3") {
+    const python = ensureRuntime(PYTHON_COMMAND, "Python");
+    const result = await spawnProcess(python, ["-c", code], {
+      input,
+      env: { PYTHONUNBUFFERED: "1" },
+    });
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      status: result.code === 0 ? "completed" : "error",
+    };
+  }
+
+  return withTempWorkspace(async (workspace) => {
+    if (language === "c") {
+      const gcc = ensureRuntime(GCC_COMMAND, "GCC");
+      const sourcePath = path.join(workspace, "main.c");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(gcc, [sourcePath, "-O2", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(outputPath, [], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "cpp") {
+      const gpp = ensureRuntime(GPP_COMMAND, "G++");
+      const sourcePath = path.join(workspace, "main.cpp");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(gpp, [sourcePath, "-O2", "-std=c++17", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(outputPath, [], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "go") {
+      const go = ensureRuntime(GO_COMMAND, "Go");
+      const sourcePath = path.join(workspace, "main.go");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const result = await spawnProcess(go, ["run", sourcePath], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "java") {
+      const javac = ensureRuntime(JAVAC_COMMAND, "Java compiler");
+      const java = ensureRuntime(JAVA_COMMAND, "Java runtime");
+      const className = sanitizeJavaClassName(code);
+      const sourcePath = path.join(workspace, `${className}.java`);
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(javac, [sourcePath], { cwd: workspace });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(java, ["-cp", workspace, className], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "csharp") {
+      const mcs = ensureRuntime(MCS_COMMAND, "Mono C# compiler");
+      const mono = ensureRuntime(MONO_COMMAND, "Mono runtime");
+      const sourcePath = path.join(workspace, "Program.cs");
+      const outputPath = path.join(workspace, "Program.exe");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(mcs, ["-out:Program.exe", sourcePath], { cwd: workspace });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(mono, [outputPath], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "rust") {
+      const rustc = ensureRuntime(RUSTC_COMMAND, "Rust compiler");
+      const sourcePath = path.join(workspace, "main.rs");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(rustc, [sourcePath, "-O", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(outputPath, [], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    if (language === "typescript") {
+      const sourcePath = path.join(workspace, "main.ts");
+      const outputDir = path.join(workspace, "dist");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(NODE_COMMAND, [TSC_COMMAND, "--target", "ES2020", "--module", "commonjs", "--outDir", outputDir, sourcePath], {
+        cwd: workspace,
+      });
+      if (compile.code !== 0) {
+        return { stdout: compile.stdout, stderr: compile.stderr, status: "error" };
+      }
+      const result = await spawnProcess(NODE_COMMAND, [path.join(outputDir, "main.js")], { cwd: workspace, input });
+      return { stdout: result.stdout, stderr: result.stderr, status: result.code === 0 ? "completed" : "error" };
+    }
+
+    throw Object.assign(new Error(`Unsupported language: ${language}`), { statusCode: 400 });
+  });
+}
+
+async function runForApi(languageInput, code, input) {
+  const language = String(languageInput || "").trim().toLowerCase();
+  const normalizedLanguage = CODELAB_LANGUAGE_MAP[language] || language;
+
+  if (!normalizedLanguage) {
+    throw Object.assign(new Error("code and language are required"), { statusCode: 400 });
+  }
+
+  return runNativeProgram(normalizedLanguage, code, input);
+}
+
 function ensureSession(sessionId) {
   const session = sessions.get(sessionId);
   if (!session) {
@@ -576,6 +833,23 @@ app.get("/", (_req, res) => {
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post(["/run", "/api/run"], async (req, res, next) => {
+  try {
+    const code = String(req.body?.code || "");
+    const languageInput = String(req.body?.language || "").trim().toLowerCase();
+    const input = String(req.body?.input || "");
+
+    if (!code.trim() || !languageInput) {
+      return res.status(400).json({ error: "code and language are required" });
+    }
+
+    const result = await runForApi(languageInput, code, input);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/session/create", (req, res, next) => {
