@@ -15,6 +15,8 @@ const JSON_LIMIT = process.env.JSON_LIMIT || "256kb";
 const MAX_CODE_LENGTH = Number(process.env.MAX_CODE_LENGTH) || 100_000;
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 8;
 const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS) || 20_000;
+const INTERACTIVE_RUN_IDLE_TIMEOUT_MS =
+  Number(process.env.INTERACTIVE_RUN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
 const SESSION_IDLE_TIMEOUT_MS =
   Number(process.env.SESSION_IDLE_TIMEOUT_MS) || 10 * 60 * 1000;
 const CLEANUP_INTERVAL_MS =
@@ -544,6 +546,19 @@ function appendRunChunk(session, stream, value) {
   }
 }
 
+function refreshCurrentRunTimer(session, reason = "Execution timed out") {
+  const run = session.currentRun;
+  if (!run) return;
+
+  clearTimeout(run.timer);
+  run.timer = setTimeout(() => {
+    if (session.currentRun?.commandId === run.commandId) {
+      terminateCurrentRun(session, reason);
+    }
+  }, run.timeoutMs || INTERACTIVE_RUN_IDLE_TIMEOUT_MS);
+  run.timer.unref();
+}
+
 function killChildProcess(child) {
   if (!child || child.killed) return;
   child.kill("SIGTERM");
@@ -564,6 +579,16 @@ function terminateCurrentRun(session, reason = "Execution stopped") {
     return;
   }
   finishRun(session, "error", new Error(reason));
+}
+
+function stopCurrentRun(session) {
+  if (!session.currentRun) {
+    throw Object.assign(new Error("No active program is running"), {
+      statusCode: 409,
+    });
+  }
+
+  terminateCurrentRun(session, "Execution stopped by user");
 }
 
 function destroySession(sessionId, reason = "destroyed") {
@@ -1032,11 +1057,12 @@ function executeCode(session, code) {
       child: null,
       workspace: null,
       terminationReason: "",
+      timeoutMs: INTERACTIVE_RUN_IDLE_TIMEOUT_MS,
       timer: setTimeout(() => {
         if (session.currentRun?.commandId === commandId) {
-          terminateCurrentRun(session, "Execution timed out");
+          terminateCurrentRun(session, "Execution timed out while waiting for output or input");
         }
-      }, RUN_TIMEOUT_MS),
+      }, INTERACTIVE_RUN_IDLE_TIMEOUT_MS),
     };
 
     session.currentRun.timer.unref();
@@ -1069,6 +1095,7 @@ function executeCode(session, code) {
             sessionId: session.id,
             commandId,
           });
+          refreshCurrentRunTimer(session, "Execution timed out while waiting for output or input");
           touchSession(session);
         });
 
@@ -1082,6 +1109,7 @@ function executeCode(session, code) {
             sessionId: session.id,
             commandId,
           });
+          refreshCurrentRunTimer(session, "Execution timed out while waiting for output or input");
           touchSession(session);
         });
 
@@ -1112,6 +1140,7 @@ function executeCode(session, code) {
           finishRun(session, "success");
         });
 
+        refreshCurrentRunTimer(session, "Execution timed out while waiting for output or input");
         touchSession(session);
       })
       .catch((error) => {
@@ -1131,6 +1160,7 @@ function sendInputToRun(session, value) {
   const text = typeof value === "string" ? value : String(value ?? "");
   try {
     session.currentRun.child.stdin.write(text);
+    refreshCurrentRunTimer(session, "Execution timed out while waiting for output or input");
     touchSession(session);
   } catch (error) {
     throw Object.assign(new Error(error?.message || "Failed to send stdin"), {
@@ -1160,6 +1190,7 @@ app.get("/", (_req, res) => {
     limits: {
       maxSessions: MAX_SESSIONS,
       runTimeoutMs: RUN_TIMEOUT_MS,
+      interactiveRunIdleTimeoutMs: INTERACTIVE_RUN_IDLE_TIMEOUT_MS,
       sessionIdleTimeoutMs: SESSION_IDLE_TIMEOUT_MS,
       maxCodeLength: MAX_CODE_LENGTH,
     },
@@ -1341,6 +1372,16 @@ wss.on("connection", (ws, req) => {
         }
 
         sendInputToRun(session, String(payload.value ?? ""));
+        return;
+      }
+
+      if (payload.type === "stop") {
+        if (!session.sockets.has(ws)) {
+          session.sockets.add(ws);
+          ws.sessionId = session.id;
+        }
+
+        stopCurrentRun(session);
         return;
       }
 
