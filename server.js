@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { spawn, spawnSync } = require("child_process");
-const { randomUUID } = require("crypto");
+const { randomUUID, timingSafeEqual } = require("crypto");
 const { WebSocketServer } = require("ws");
 const fs = require("fs/promises");
 const os = require("os");
@@ -23,6 +23,10 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || "*")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const RUNNER_API_KEY = String(process.env.RUNNER_API_KEY || process.env.CODELABS_RUNNER_API_KEY || "").trim();
+const REQUIRE_RUNNER_KEY = String(
+  process.env.REQUIRE_RUNNER_KEY || (process.env.NODE_ENV === "production" ? "true" : "false"),
+).trim().toLowerCase() === "true";
 const CODELAB_LANGUAGE_MAP = {
   c: "c",
   cpp: "cpp",
@@ -221,6 +225,37 @@ function buildCorsOptions() {
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
     credentials: true,
   };
+}
+
+function safeEquals(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""), "utf8");
+  const rightBuffer = Buffer.from(String(right || ""), "utf8");
+  if (!leftBuffer.length || leftBuffer.length !== rightBuffer.length) return false;
+  try {
+    return timingSafeEqual(leftBuffer, rightBuffer);
+  } catch {
+    return false;
+  }
+}
+
+function getRunnerKeyFromRequest(req) {
+  const headerKey = req.headers["x-runner-key"] || req.headers["X-Runner-Key"];
+  if (typeof headerKey === "string" && headerKey.trim()) {
+    return headerKey.trim();
+  }
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const queryKey = url.searchParams.get("runnerKey") || url.searchParams.get("key");
+    return String(queryKey || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function isAuthorizedRunnerRequest(req) {
+  if (!REQUIRE_RUNNER_KEY && !RUNNER_API_KEY) return true;
+  if (!RUNNER_API_KEY) return false;
+  return safeEquals(getRunnerKeyFromRequest(req), RUNNER_API_KEY);
 }
 
 function detectPythonCommand() {
@@ -837,6 +872,10 @@ app.get("/", (_req, res) => {
 
 app.post(["/run", "/api/run"], async (req, res, next) => {
   try {
+    if (!isAuthorizedRunnerRequest(req)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const code = String(req.body?.code || "");
     const languageInput = String(req.body?.language || "").trim().toLowerCase();
     const input = String(req.body?.input || "");
@@ -854,6 +893,9 @@ app.post(["/run", "/api/run"], async (req, res, next) => {
 
 app.post("/session/create", (req, res, next) => {
   try {
+    if (!isAuthorizedRunnerRequest(req)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
     const session = createSession(req.body?.language);
     res.status(201).json({
       sessionId: session.id,
@@ -867,6 +909,9 @@ app.post("/session/create", (req, res, next) => {
 
 app.post("/session/run", async (req, res, next) => {
   try {
+    if (!isAuthorizedRunnerRequest(req)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
     const session = ensureSession(req.body?.sessionId);
     const result = await executeCode(session, req.body?.code);
     res.json(result);
@@ -877,6 +922,9 @@ app.post("/session/run", async (req, res, next) => {
 
 app.delete("/session/:id", (req, res, next) => {
   try {
+    if (!isAuthorizedRunnerRequest(req)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
     ensureSession(req.params.id);
     destroySession(req.params.id, "deleted_by_client");
     res.json({ success: true });
@@ -931,6 +979,15 @@ function attachSocketToSession(ws, sessionId) {
 }
 
 wss.on("connection", (ws, req) => {
+  if (!isAuthorizedRunnerRequest(req)) {
+    try {
+      ws.close(1008, "Unauthorized");
+    } catch (_error) {
+      ws.terminate();
+    }
+    return;
+  }
+
   ws.isAlive = true;
   ws.on("pong", () => {
     ws.isAlive = true;
