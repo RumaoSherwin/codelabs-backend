@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { spawn, spawnSync } = require("child_process");
-const { randomUUID, timingSafeEqual } = require("crypto");
+const { createHmac, randomUUID, timingSafeEqual } = require("crypto");
 const { WebSocketServer } = require("ws");
 const fs = require("fs/promises");
 const os = require("os");
@@ -24,6 +24,7 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || "*")
   .map((origin) => origin.trim())
   .filter(Boolean);
 const RUNNER_API_KEY = String(process.env.RUNNER_API_KEY || process.env.CODELABS_RUNNER_API_KEY || "").trim();
+const RUNNER_SESSION_SECRET = String(process.env.RUNNER_SESSION_SECRET || process.env.CODELABS_RUNNER_SESSION_SECRET || "").trim();
 const REQUIRE_RUNNER_KEY = String(
   process.env.REQUIRE_RUNNER_KEY || (process.env.NODE_ENV === "production" ? "true" : "false"),
 ).trim().toLowerCase() === "true";
@@ -206,6 +207,51 @@ function log(level, message, meta = undefined) {
   console.log(line);
 }
 
+function buildRunnerErrorPayload(error, req) {
+  const statusCode =
+    error?.type === "entity.too.large"
+      ? 413
+      : error?.statusCode || error?.status || 500;
+  const reportId = randomUUID();
+  const stage = String(error?.stage || (statusCode >= 500 ? "runner_internal" : "runner_request")).trim();
+  const hint = String(
+    error?.hint ||
+      (stage === "runner_session_secret"
+        ? "Set RUNNER_SESSION_SECRET on Railway and match it with the website session secret."
+        : stage === "runner_api_key"
+          ? "Set RUNNER_API_KEY on Railway and match it with the website runner API key."
+          : stage === "runner_execute"
+            ? "Check the selected language runtime and recent runner logs."
+            : ""),
+  ).trim();
+
+  if (statusCode >= 500) {
+    log("error", "Unhandled request error", {
+      reportId,
+      stage,
+      route: req?.url || "",
+      method: req?.method || "",
+      error: error?.message || "",
+      hint,
+      stack: error?.stack || "",
+    });
+  }
+
+  return {
+    statusCode,
+    payload: {
+      error: String(error?.message || (statusCode >= 500 ? "Internal server error" : "Request failed")),
+      report: {
+        id: reportId,
+        stage,
+        hint,
+        statusCode,
+        timestamp: new Date().toISOString(),
+      },
+    },
+  };
+}
+
 function isOriginAllowed(origin) {
   if (!origin || ALLOWED_ORIGINS.includes("*")) {
     return true;
@@ -252,10 +298,111 @@ function getRunnerKeyFromRequest(req) {
   }
 }
 
-function isAuthorizedRunnerRequest(req) {
-  if (!REQUIRE_RUNNER_KEY && !RUNNER_API_KEY) return true;
-  if (!RUNNER_API_KEY) return false;
-  return safeEquals(getRunnerKeyFromRequest(req), RUNNER_API_KEY);
+function getRunnerSessionTokenFromRequest(req) {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  if (typeof authHeader === "string") {
+    const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (bearerMatch) {
+      return bearerMatch[1].trim();
+    }
+  }
+
+  const headerToken =
+    req.headers["x-runner-session-token"] || req.headers["X-Runner-Session-Token"];
+  if (typeof headerToken === "string" && headerToken.trim()) {
+    return headerToken.trim();
+  }
+
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    return String(url.searchParams.get("token") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function fromBase64Url(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  return Buffer.from(padded, "base64").toString("utf8");
+}
+
+function createSessionTokenSignature(payloadSegment) {
+  return createHmac("sha256", RUNNER_SESSION_SECRET)
+    .update(payloadSegment)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function verifyRunnerSessionToken(token, expectedSessionId = "") {
+  if (!RUNNER_SESSION_SECRET) {
+    return null;
+  }
+
+  const raw = String(token || "").trim();
+  const separatorIndex = raw.indexOf(".");
+  if (!raw || separatorIndex <= 0) {
+    return null;
+  }
+
+  const payloadSegment = raw.slice(0, separatorIndex);
+  const signature = raw.slice(separatorIndex + 1);
+  if (!safeEquals(signature, createSessionTokenSignature(payloadSegment))) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(fromBase64Url(payloadSegment));
+  } catch {
+    return null;
+  }
+
+  const sessionId = String(payload?.sid || "").trim();
+  const exp = Number(payload?.exp || 0);
+  if (!sessionId || !Number.isFinite(exp) || exp <= Math.floor(Date.now() / 1000)) {
+    return null;
+  }
+  if (expectedSessionId && sessionId !== String(expectedSessionId).trim()) {
+    return null;
+  }
+
+  return {
+    sessionId,
+    userId: String(payload?.uid || "").trim(),
+    language: String(payload?.lang || "").trim().toLowerCase(),
+    expiresAt: exp,
+  };
+}
+
+function authorizeRunnerRequest(req, options = {}) {
+  const expectedSessionId = String(options.expectedSessionId || "").trim();
+
+  if (RUNNER_API_KEY && safeEquals(getRunnerKeyFromRequest(req), RUNNER_API_KEY)) {
+    return { type: "shared-key" };
+  }
+
+  if (options.allowSessionToken) {
+    const tokenPayload = verifyRunnerSessionToken(
+      getRunnerSessionTokenFromRequest(req),
+      expectedSessionId,
+    );
+    if (tokenPayload) {
+      return { type: "session-token", token: tokenPayload };
+    }
+  }
+
+  if (!REQUIRE_RUNNER_KEY && !RUNNER_API_KEY && !options.allowSessionToken) {
+    return { type: "unprotected" };
+  }
+
+  return null;
+}
+
+function isAuthorizedRunnerRequest(req, options = {}) {
+  return Boolean(authorizeRunnerRequest(req, options));
 }
 
 function detectPythonCommand() {
@@ -300,65 +447,6 @@ const MONO_COMMAND = detectCommand(["mono"]);
 const RUSTC_COMMAND = detectCommand(["rustc"]);
 const sessions = new Map();
 
-function createLineParser(onMessage) {
-  let buffer = "";
-
-  return (chunk) => {
-    buffer += chunk.toString();
-
-    let newlineIndex = buffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex).trim();
-      buffer = buffer.slice(newlineIndex + 1);
-
-      if (line) {
-        try {
-          onMessage(JSON.parse(line));
-        } catch (error) {
-          log("error", "Failed to parse worker message", {
-            line,
-            error: error.message,
-          });
-        }
-      }
-
-      newlineIndex = buffer.indexOf("\n");
-    }
-  };
-}
-
-function getLanguageConfig(language) {
-  const normalized = String(language || "").trim().toLowerCase();
-
-  if (normalized === "python") {
-    if (!PYTHON_COMMAND) {
-      throw new Error("Python is not installed on this server");
-    }
-
-    return {
-      language: "python",
-      command: PYTHON_COMMAND,
-      args: ["-u", "-c", PYTHON_WORKER],
-      env: {
-        PYTHONUNBUFFERED: "1",
-      },
-    };
-  }
-
-  if (normalized === "javascript" || normalized === "node" || normalized === "js") {
-    return {
-      language: "javascript",
-      command: NODE_COMMAND,
-      args: ["-e", NODE_WORKER],
-      env: {
-        NODE_NO_WARNINGS: "1",
-      },
-    };
-  }
-
-  throw new Error("Unsupported language. Use 'python' or 'javascript'.");
-}
-
 function touchSession(session) {
   session.lastActivityAt = Date.now();
 }
@@ -385,28 +473,55 @@ function broadcastSession(session, payload) {
   }
 }
 
+function cleanupRunArtifacts(run) {
+  if (run?.workspace) {
+    fs.rm(run.workspace, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 function finishRun(session, status, error = null) {
   if (!session.currentRun) {
     return;
   }
 
-  const { timer, resolve, reject, outputChunks, stderrChunks, stdoutChunks } =
-    session.currentRun;
+  const run = session.currentRun;
+  const { timer, resolve, reject, outputChunks, stderrChunks, stdoutChunks } = run;
 
   clearTimeout(timer);
+  if (error?.stdout) {
+    stdoutChunks.push(String(error.stdout));
+    outputChunks.push(String(error.stdout));
+  }
+  if (error?.stderr) {
+    stderrChunks.push(String(error.stderr));
+    outputChunks.push(String(error.stderr));
+  }
   const output = outputChunks.join("");
   const stdout = stdoutChunks.join("");
   const stderr = stderrChunks.join("");
 
   session.currentRun = null;
   touchSession(session);
+  cleanupRunArtifacts(run);
+
+  const payload = {
+    type: "run_complete",
+    sessionId: session.id,
+    commandId: run.commandId,
+    status: status === "success" ? "completed" : "error",
+    output,
+    stdout,
+    stderr,
+  };
 
   if (status === "success") {
+    broadcastSession(session, payload);
     resolve({ output, stdout, stderr });
     return;
   }
 
   const message = error?.message || "Code execution failed";
+  broadcastSession(session, { ...payload, error: message });
   const details = {
     output,
     stdout,
@@ -429,6 +544,28 @@ function appendRunChunk(session, stream, value) {
   }
 }
 
+function killChildProcess(child) {
+  if (!child || child.killed) return;
+  child.kill("SIGTERM");
+  setTimeout(() => {
+    if (!child.killed) {
+      child.kill("SIGKILL");
+    }
+  }, 1500).unref();
+}
+
+function terminateCurrentRun(session, reason = "Execution stopped") {
+  const run = session.currentRun;
+  if (!run) return;
+
+  run.terminationReason = reason;
+  if (run.child) {
+    killChildProcess(run.child);
+    return;
+  }
+  finishRun(session, "error", new Error(reason));
+}
+
 function destroySession(sessionId, reason = "destroyed") {
   const session = sessions.get(sessionId);
   if (!session) {
@@ -436,7 +573,7 @@ function destroySession(sessionId, reason = "destroyed") {
   }
 
   if (session.currentRun) {
-    finishRun(session, "error", new Error(`Session ${reason}`));
+    terminateCurrentRun(session, `Session ${reason}`);
   }
 
   sessions.delete(sessionId);
@@ -455,80 +592,12 @@ function destroySession(sessionId, reason = "destroyed") {
   }
 
   session.sockets.clear();
-
-  if (!session.process.killed) {
-    session.process.kill("SIGTERM");
-
-    setTimeout(() => {
-      if (!session.process.killed) {
-        session.process.kill("SIGKILL");
-      }
-    }, 1500).unref();
+  if (session.workspaceRoot) {
+    fs.rm(session.workspaceRoot, { recursive: true, force: true }).catch(() => {});
   }
 
   log("info", "Session destroyed", { sessionId, reason });
   return true;
-}
-
-function registerSessionProcess(session) {
-  const parseStdout = createLineParser((message) => {
-    const { type, value = "", commandId } = message;
-
-    if (type === "ready") {
-      touchSession(session);
-      return;
-    }
-
-    if (type === "stdout" || type === "stderr") {
-      appendRunChunk(session, type, value);
-      broadcastSession(session, {
-        type: "output",
-        stream: type,
-        value,
-        sessionId: session.id,
-        commandId,
-      });
-      touchSession(session);
-      return;
-    }
-
-    if (type === "result") {
-      finishRun(session, "success");
-    }
-  });
-
-  session.process.stdout.on("data", parseStdout);
-
-  session.process.stderr.on("data", (chunk) => {
-    const value = chunk.toString();
-    appendRunChunk(session, "stderr", value);
-    broadcastSession(session, {
-      type: "output",
-      stream: "stderr",
-      value,
-      sessionId: session.id,
-    });
-    touchSession(session);
-  });
-
-  session.process.on("exit", (code, signal) => {
-    if (!sessions.has(session.id)) {
-      return;
-    }
-
-    destroySession(session.id, `process_exit:${signal || code || 0}`);
-  });
-
-  session.process.on("error", (error) => {
-    log("error", "Session process error", {
-      sessionId: session.id,
-      error: error.message,
-    });
-
-    if (sessions.has(session.id)) {
-      destroySession(session.id, "process_error");
-    }
-  });
 }
 
 function createSession(language) {
@@ -536,29 +605,25 @@ function createSession(language) {
     throw new Error("Session limit reached. Try again after closing an idle session.");
   }
 
-  const config = getLanguageConfig(language);
-  const id = randomUUID();
-  const child = spawn(config.command, config.args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-    env: {
-      ...process.env,
-      ...config.env,
-    },
-  });
+  const normalizedLanguage =
+    CODELAB_LANGUAGE_MAP[String(language || "").trim().toLowerCase()] ||
+    String(language || "").trim().toLowerCase();
+  if (!normalizedLanguage || !Object.values(CODELAB_LANGUAGE_MAP).includes(normalizedLanguage)) {
+    throw new Error("Unsupported language");
+  }
 
+  const id = randomUUID();
   const session = {
     id,
-    language: config.language,
-    process: child,
+    language: normalizedLanguage,
     sockets: new Set(),
     currentRun: null,
     createdAt: Date.now(),
     lastActivityAt: Date.now(),
+    workspaceRoot: null,
   };
 
   sessions.set(id, session);
-  registerSessionProcess(session);
   log("info", "Session created", { sessionId: id, language: session.language });
   return session;
 }
@@ -647,6 +712,149 @@ async function withTempWorkspace(fn) {
 function ensureRuntime(command, label) {
   if (command) return command;
   throw Object.assign(new Error(`${label} is not installed in this container`), { statusCode: 500 });
+}
+
+async function ensureSessionWorkspaceRoot(session) {
+  if (session.workspaceRoot) return session.workspaceRoot;
+  session.workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `sifra-session-${session.id}-`));
+  return session.workspaceRoot;
+}
+
+async function createRunWorkspace(session) {
+  const workspaceRoot = await ensureSessionWorkspaceRoot(session);
+  return fs.mkdtemp(path.join(workspaceRoot, "run-"));
+}
+
+function spawnInteractiveChild(command, args, options = {}) {
+  return spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env ? { ...process.env, ...options.env } : process.env,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+async function prepareInteractiveProgram(language, code, session) {
+  const workspace = await createRunWorkspace(session);
+
+  try {
+    if (language === "javascript") {
+      const sourcePath = path.join(workspace, "main.js");
+      await fs.writeFile(sourcePath, code, "utf8");
+      return {
+        workspace,
+        child: spawnInteractiveChild(NODE_COMMAND, [sourcePath], {
+          cwd: workspace,
+          env: { NODE_NO_WARNINGS: "1" },
+        }),
+      };
+    }
+
+    if (language === "python3") {
+      const python = ensureRuntime(PYTHON_COMMAND, "Python");
+      const sourcePath = path.join(workspace, "main.py");
+      await fs.writeFile(sourcePath, code, "utf8");
+      return {
+        workspace,
+        child: spawnInteractiveChild(python, ["-u", sourcePath], {
+          cwd: workspace,
+          env: { PYTHONUNBUFFERED: "1" },
+        }),
+      };
+    }
+
+    if (language === "c") {
+      const gcc = ensureRuntime(GCC_COMMAND, "GCC");
+      const sourcePath = path.join(workspace, "main.c");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(gcc, [sourcePath, "-O2", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return { workspace, child: spawnInteractiveChild(outputPath, [], { cwd: workspace }) };
+    }
+
+    if (language === "cpp") {
+      const gpp = ensureRuntime(GPP_COMMAND, "G++");
+      const sourcePath = path.join(workspace, "main.cpp");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(gpp, [sourcePath, "-O2", "-std=c++17", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return { workspace, child: spawnInteractiveChild(outputPath, [], { cwd: workspace }) };
+    }
+
+    if (language === "go") {
+      const go = ensureRuntime(GO_COMMAND, "Go");
+      const sourcePath = path.join(workspace, "main.go");
+      await fs.writeFile(sourcePath, code, "utf8");
+      return { workspace, child: spawnInteractiveChild(go, ["run", sourcePath], { cwd: workspace }) };
+    }
+
+    if (language === "java") {
+      const javac = ensureRuntime(JAVAC_COMMAND, "Java compiler");
+      const java = ensureRuntime(JAVA_COMMAND, "Java runtime");
+      const className = sanitizeJavaClassName(code);
+      const sourcePath = path.join(workspace, `${className}.java`);
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(javac, [sourcePath], { cwd: workspace });
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return { workspace, child: spawnInteractiveChild(java, ["-cp", workspace, className], { cwd: workspace }) };
+    }
+
+    if (language === "csharp") {
+      const mcs = ensureRuntime(MCS_COMMAND, "Mono C# compiler");
+      const mono = ensureRuntime(MONO_COMMAND, "Mono runtime");
+      const sourcePath = path.join(workspace, "Program.cs");
+      const outputPath = path.join(workspace, "Program.exe");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(mcs, ["-out:Program.exe", sourcePath], { cwd: workspace });
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return { workspace, child: spawnInteractiveChild(mono, [outputPath], { cwd: workspace }) };
+    }
+
+    if (language === "rust") {
+      const rustc = ensureRuntime(RUSTC_COMMAND, "Rust compiler");
+      const sourcePath = path.join(workspace, "main.rs");
+      const outputPath = path.join(workspace, "main");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(rustc, [sourcePath, "-O", "-o", outputPath], { cwd: workspace });
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return { workspace, child: spawnInteractiveChild(outputPath, [], { cwd: workspace }) };
+    }
+
+    if (language === "typescript") {
+      const sourcePath = path.join(workspace, "main.ts");
+      const outputDir = path.join(workspace, "dist");
+      await fs.writeFile(sourcePath, code, "utf8");
+      const compile = await spawnProcess(
+        NODE_COMMAND,
+        [TSC_COMMAND, "--target", "ES2020", "--module", "commonjs", "--outDir", outputDir, sourcePath],
+        { cwd: workspace },
+      );
+      if (compile.code !== 0) {
+        throw Object.assign(new Error("Compilation failed"), compile);
+      }
+      return {
+        workspace,
+        child: spawnInteractiveChild(NODE_COMMAND, [path.join(outputDir, "main.js")], { cwd: workspace }),
+      };
+    }
+
+    throw Object.assign(new Error(`Unsupported language: ${language}`), { statusCode: 400 });
+  } catch (error) {
+    await fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function runNativeProgram(language, code, input = "") {
@@ -821,23 +1029,114 @@ function executeCode(session, code) {
       stderrChunks: [],
       resolve,
       reject,
+      child: null,
+      workspace: null,
+      terminationReason: "",
       timer: setTimeout(() => {
         if (session.currentRun?.commandId === commandId) {
-          finishRun(session, "error", new Error("Execution timed out"));
+          terminateCurrentRun(session, "Execution timed out");
         }
       }, RUN_TIMEOUT_MS),
     };
 
     session.currentRun.timer.unref();
 
-    try {
-      session.process.stdin.write(
-        `${JSON.stringify({ commandId, code: trimmed })}\n`,
-      );
-    } catch (error) {
-      finishRun(session, "error", error);
-    }
+    broadcastSession(session, {
+      type: "run_started",
+      sessionId: session.id,
+      commandId,
+      language: session.language,
+    });
+
+    prepareInteractiveProgram(session.language, trimmed, session)
+      .then(({ child, workspace }) => {
+        if (!session.currentRun || session.currentRun.commandId !== commandId) {
+          killChildProcess(child);
+          fs.rm(workspace, { recursive: true, force: true }).catch(() => {});
+          return;
+        }
+
+        session.currentRun.child = child;
+        session.currentRun.workspace = workspace;
+
+        child.stdout.on("data", (chunk) => {
+          const value = chunk.toString();
+          appendRunChunk(session, "stdout", value);
+          broadcastSession(session, {
+            type: "output",
+            stream: "stdout",
+            value,
+            sessionId: session.id,
+            commandId,
+          });
+          touchSession(session);
+        });
+
+        child.stderr.on("data", (chunk) => {
+          const value = chunk.toString();
+          appendRunChunk(session, "stderr", value);
+          broadcastSession(session, {
+            type: "output",
+            stream: "stderr",
+            value,
+            sessionId: session.id,
+            commandId,
+          });
+          touchSession(session);
+        });
+
+        child.on("error", (error) => {
+          if (session.currentRun?.commandId !== commandId) return;
+          finishRun(session, "error", error);
+        });
+
+        child.on("close", (code, signal) => {
+          if (session.currentRun?.commandId !== commandId) return;
+
+          const reason = session.currentRun.terminationReason;
+          if (reason) {
+            finishRun(session, "error", new Error(reason));
+            return;
+          }
+
+          if (signal) {
+            finishRun(session, "error", new Error(`Process exited with signal ${signal}`));
+            return;
+          }
+
+          if (typeof code === "number" && code !== 0) {
+            finishRun(session, "error", new Error(`Process exited with code ${code}`));
+            return;
+          }
+
+          finishRun(session, "success");
+        });
+
+        touchSession(session);
+      })
+      .catch((error) => {
+        if (session.currentRun?.commandId !== commandId) return;
+        finishRun(session, "error", error);
+      });
   });
+}
+
+function sendInputToRun(session, value) {
+  if (!session.currentRun || !session.currentRun.child) {
+    throw Object.assign(new Error("No active program is waiting for input"), {
+      statusCode: 409,
+    });
+  }
+
+  const text = typeof value === "string" ? value : String(value ?? "");
+  try {
+    session.currentRun.child.stdin.write(text);
+    touchSession(session);
+  } catch (error) {
+    throw Object.assign(new Error(error?.message || "Failed to send stdin"), {
+      statusCode: 500,
+    });
+  }
 }
 
 const app = express();
@@ -893,7 +1192,7 @@ app.post(["/run", "/api/run"], async (req, res, next) => {
 
 app.post("/session/create", (req, res, next) => {
   try {
-    if (!isAuthorizedRunnerRequest(req)) {
+    if (!authorizeRunnerRequest(req, { allowSessionToken: false })) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     const session = createSession(req.body?.language);
@@ -909,7 +1208,11 @@ app.post("/session/create", (req, res, next) => {
 
 app.post("/session/run", async (req, res, next) => {
   try {
-    if (!isAuthorizedRunnerRequest(req)) {
+    const auth = authorizeRunnerRequest(req, {
+      allowSessionToken: true,
+      expectedSessionId: req.body?.sessionId,
+    });
+    if (!auth) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     const session = ensureSession(req.body?.sessionId);
@@ -922,7 +1225,11 @@ app.post("/session/run", async (req, res, next) => {
 
 app.delete("/session/:id", (req, res, next) => {
   try {
-    if (!isAuthorizedRunnerRequest(req)) {
+    const auth = authorizeRunnerRequest(req, {
+      allowSessionToken: true,
+      expectedSessionId: req.params.id,
+    });
+    if (!auth) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     ensureSession(req.params.id);
@@ -937,25 +1244,9 @@ app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-app.use((error, _req, res, _next) => {
-  const statusCode =
-    error.type === "entity.too.large"
-      ? 413
-      : error.statusCode || error.status || 500;
-
-  if (statusCode >= 500) {
-    log("error", "Unhandled request error", {
-      error: error.message,
-      stack: error.stack,
-    });
-  }
-
-  res.status(statusCode).json({
-    error:
-      statusCode >= 500
-        ? "Internal server error"
-        : error.message || "Request failed",
-  });
+app.use((error, req, res, _next) => {
+  const { statusCode, payload } = buildRunnerErrorPayload(error, req);
+  res.status(statusCode).json(payload);
 });
 
 const server = http.createServer(app);
@@ -979,7 +1270,8 @@ function attachSocketToSession(ws, sessionId) {
 }
 
 wss.on("connection", (ws, req) => {
-  if (!isAuthorizedRunnerRequest(req)) {
+  const auth = authorizeRunnerRequest(req, { allowSessionToken: true });
+  if (!auth) {
     try {
       ws.close(1008, "Unauthorized");
     } catch (_error) {
@@ -995,7 +1287,14 @@ wss.on("connection", (ws, req) => {
 
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const initialSessionId = url.searchParams.get("sessionId");
+  ws.authType = auth.type;
+  ws.authSessionId = auth.token?.sessionId || "";
   if (initialSessionId) {
+    if (ws.authType === "session-token" && ws.authSessionId && ws.authSessionId !== initialSessionId) {
+      sendWebSocket(ws, { type: "error", error: "Session token does not match this session" });
+      ws.close(1008, "Unauthorized");
+      return;
+    }
     attachSocketToSession(ws, initialSessionId);
   }
 
@@ -1015,25 +1314,33 @@ wss.on("connection", (ws, req) => {
       }
 
       if (payload.type === "attach") {
+        if (ws.authType === "session-token" && ws.authSessionId && ws.authSessionId !== payload.sessionId) {
+          sendWebSocket(ws, { type: "error", error: "Session token does not match this session" });
+          return;
+        }
         attachSocketToSession(ws, payload.sessionId);
         return;
       }
 
       const session = ensureSession(payload.sessionId || ws.sessionId);
 
-      if (payload.type === "run" || payload.type === "input") {
+      if (payload.type === "run") {
         if (!session.sockets.has(ws)) {
           session.sockets.add(ws);
           ws.sessionId = session.id;
         }
 
-        const code = payload.code ?? payload.value ?? "";
-        const result = await executeCode(session, code);
-        sendWebSocket(ws, {
-          type: "run_complete",
-          sessionId: session.id,
-          ...result,
-        });
+        await executeCode(session, payload.code ?? "");
+        return;
+      }
+
+      if (payload.type === "input") {
+        if (!session.sockets.has(ws)) {
+          session.sockets.add(ws);
+          ws.sessionId = session.id;
+        }
+
+        sendInputToRun(session, String(payload.value ?? ""));
         return;
       }
 
