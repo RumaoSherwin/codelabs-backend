@@ -13,7 +13,7 @@ const HOST = "0.0.0.0";
 const WS_PATH = process.env.WS_PATH || "/ws";
 const JSON_LIMIT = process.env.JSON_LIMIT || "256kb";
 const MAX_CODE_LENGTH = Number(process.env.MAX_CODE_LENGTH) || 100_000;
-const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 8;
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 10;
 const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS) || 20_000;
 const INTERACTIVE_RUN_IDLE_TIMEOUT_MS =
   Number(process.env.INTERACTIVE_RUN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
