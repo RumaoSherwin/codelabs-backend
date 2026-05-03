@@ -1287,6 +1287,11 @@ function attachSocketToSession(ws, sessionId) {
   const session = sessions.get(sessionId);
   if (!session) {
     sendWebSocket(ws, { type: "error", error: "Session not found" });
+    try {
+      ws.close(1008, "Session not found");
+    } catch (_error) {
+      ws.terminate();
+    }
     return false;
   }
 
@@ -1326,7 +1331,9 @@ wss.on("connection", (ws, req) => {
       ws.close(1008, "Unauthorized");
       return;
     }
-    attachSocketToSession(ws, initialSessionId);
+    if (!attachSocketToSession(ws, initialSessionId)) {
+      return;
+    }
   }
 
   ws.on("message", async (rawMessage) => {
