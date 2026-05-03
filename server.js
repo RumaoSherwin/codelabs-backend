@@ -1294,6 +1294,12 @@ const wss = new WebSocketServer({ server, path: WS_PATH });
 function attachSocketToSession(ws, sessionId) {
   const session = sessions.get(sessionId);
   if (ws.expectedInstanceId && ws.expectedInstanceId !== RUNNER_INSTANCE_ID) {
+    log("error", "WebSocket attach rejected: instance mismatch", {
+      expectedInstanceId: ws.expectedInstanceId,
+      runnerInstanceId: RUNNER_INSTANCE_ID,
+      sessionId,
+      authSessionId: ws.authSessionId || "",
+    });
     sendWebSocket(ws, {
       type: "error",
       error:
@@ -1310,6 +1316,12 @@ function attachSocketToSession(ws, sessionId) {
     return false;
   }
   if (!session) {
+    log("error", "WebSocket attach rejected: session not found", {
+      sessionId,
+      authSessionId: ws.authSessionId || "",
+      expectedInstanceId: ws.expectedInstanceId || "",
+      runnerInstanceId: RUNNER_INSTANCE_ID,
+    });
     sendWebSocket(ws, { type: "error", error: "Session not found" });
     try {
       ws.close(1008, "Session not found");
@@ -1322,6 +1334,14 @@ function attachSocketToSession(ws, sessionId) {
   session.sockets.add(ws);
   ws.sessionId = sessionId;
   touchSession(session);
+  log("info", "WebSocket attached to session", {
+    sessionId,
+    authType: ws.authType || "",
+    authSessionId: ws.authSessionId || "",
+    expectedInstanceId: ws.expectedInstanceId || "",
+    runnerInstanceId: RUNNER_INSTANCE_ID,
+    sockets: session.sockets.size,
+  });
   sendWebSocket(ws, {
     type: "attached",
     session: serializeSession(session),
@@ -1331,7 +1351,27 @@ function attachSocketToSession(ws, sessionId) {
 
 wss.on("connection", (ws, req) => {
   const auth = authorizeRunnerRequest(req, { allowSessionToken: true });
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const initialSessionId = url.searchParams.get("sessionId");
+  const expectedInstanceId = String(url.searchParams.get("instanceId") || "").trim();
+  log("info", "WebSocket connection opened", {
+    path: req.url || "",
+    initialSessionId: initialSessionId || "",
+    expectedInstanceId,
+    runnerInstanceId: RUNNER_INSTANCE_ID,
+    host: req.headers.host || "",
+    origin: req.headers.origin || "",
+    userAgent: req.headers["user-agent"] || "",
+  });
   if (!auth) {
+    log("error", "WebSocket unauthorized", {
+      path: req.url || "",
+      initialSessionId: initialSessionId || "",
+      expectedInstanceId,
+      runnerInstanceId: RUNNER_INSTANCE_ID,
+      host: req.headers.host || "",
+      origin: req.headers.origin || "",
+    });
     try {
       ws.close(1008, "Unauthorized");
     } catch (_error) {
@@ -1345,13 +1385,17 @@ wss.on("connection", (ws, req) => {
     ws.isAlive = true;
   });
 
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  const initialSessionId = url.searchParams.get("sessionId");
-  ws.expectedInstanceId = String(url.searchParams.get("instanceId") || "").trim();
+  ws.expectedInstanceId = expectedInstanceId;
   ws.authType = auth.type;
   ws.authSessionId = auth.token?.sessionId || "";
   if (initialSessionId) {
     if (ws.authType === "session-token" && ws.authSessionId && ws.authSessionId !== initialSessionId) {
+      log("error", "WebSocket attach rejected: token/session mismatch", {
+        initialSessionId,
+        authSessionId: ws.authSessionId,
+        expectedInstanceId: ws.expectedInstanceId || "",
+        runnerInstanceId: RUNNER_INSTANCE_ID,
+      });
       sendWebSocket(ws, { type: "error", error: "Session token does not match this session" });
       ws.close(1008, "Unauthorized");
       return;
@@ -1378,6 +1422,12 @@ wss.on("connection", (ws, req) => {
 
       if (payload.type === "attach") {
         if (ws.authType === "session-token" && ws.authSessionId && ws.authSessionId !== payload.sessionId) {
+          log("error", "WebSocket message attach rejected: token/session mismatch", {
+            payloadSessionId: payload.sessionId || "",
+            authSessionId: ws.authSessionId,
+            expectedInstanceId: ws.expectedInstanceId || "",
+            runnerInstanceId: RUNNER_INSTANCE_ID,
+          });
           sendWebSocket(ws, { type: "error", error: "Session token does not match this session" });
           return;
         }
@@ -1422,6 +1472,10 @@ wss.on("connection", (ws, req) => {
         error: "Unsupported message type",
       });
     } catch (error) {
+      log("error", "WebSocket message handling failed", {
+        sessionId: payload?.sessionId || ws.sessionId || "",
+        error: error.message || "WebSocket request failed",
+      });
       sendWebSocket(ws, {
         type: "error",
         error: error.message || "WebSocket request failed",
@@ -1429,12 +1483,22 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reasonBuffer) => {
+    const reason = Buffer.isBuffer(reasonBuffer) ? reasonBuffer.toString() : String(reasonBuffer || "");
     const session = sessions.get(ws.sessionId);
     if (session) {
       session.sockets.delete(ws);
       touchSession(session);
     }
+    log("info", "WebSocket closed", {
+      sessionId: ws.sessionId || "",
+      authType: ws.authType || "",
+      authSessionId: ws.authSessionId || "",
+      expectedInstanceId: ws.expectedInstanceId || "",
+      runnerInstanceId: RUNNER_INSTANCE_ID,
+      code,
+      reason,
+    });
   });
 });
 
