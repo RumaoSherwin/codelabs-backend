@@ -582,7 +582,13 @@ function terminateCurrentRun(session, reason = "Execution stopped") {
 
   run.terminationReason = reason;
   if (run.child) {
+    const commandId = run.commandId;
     killChildProcess(run.child);
+    setTimeout(() => {
+      if (session.currentRun?.commandId === commandId) {
+        finishRun(session, "error", new Error(reason));
+      }
+    }, 1800).unref();
     return;
   }
   finishRun(session, "error", new Error(reason));
@@ -630,6 +636,17 @@ function destroySession(sessionId, reason = "destroyed") {
 
   log("info", "Session destroyed", { sessionId, reason });
   return true;
+}
+
+function isExpectedSessionTeardownError(error) {
+  const message = String(error?.message || "").trim();
+  return (
+    message === "Session deleted_by_client" ||
+    message === "Session idle_timeout" ||
+    message.startsWith("Session shutdown:") ||
+    message === "Session client_closed" ||
+    message === "Session client_aborted"
+  );
 }
 
 function createSession(language) {
@@ -1477,6 +1494,19 @@ wss.on("connection", (ws, req) => {
         error: "Unsupported message type",
       });
     } catch (error) {
+      if (isExpectedSessionTeardownError(error)) {
+        log("info", "WebSocket message ignored after session teardown", {
+          sessionId: payload?.sessionId || ws.sessionId || "",
+          reason: error.message || "",
+        });
+        try {
+          ws.close(1000, "session_closed");
+        } catch (_closeError) {
+          ws.terminate();
+        }
+        return;
+      }
+
       log("error", "WebSocket message handling failed", {
         sessionId: payload?.sessionId || ws.sessionId || "",
         error: error.message || "WebSocket request failed",
