@@ -30,6 +30,12 @@ const RUNNER_SESSION_SECRET = String(process.env.RUNNER_SESSION_SECRET || proces
 const REQUIRE_RUNNER_KEY = String(
   process.env.REQUIRE_RUNNER_KEY || (process.env.NODE_ENV === "production" ? "true" : "false"),
 ).trim().toLowerCase() === "true";
+const RUNNER_INSTANCE_ID = String(
+  process.env.RUNNER_INSTANCE_ID ||
+    process.env.RAILWAY_REPLICA_ID ||
+    process.env.RAILWAY_DEPLOYMENT_ID ||
+    randomUUID(),
+).trim();
 const CODELAB_LANGUAGE_MAP = {
   c: "c",
   cpp: "cpp",
@@ -1179,6 +1185,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "browser-ide-backend",
+    instanceId: RUNNER_INSTANCE_ID,
     transport: {
       http: true,
       websocket: WS_PATH,
@@ -1230,6 +1237,7 @@ app.post("/session/create", (req, res, next) => {
     res.status(201).json({
       sessionId: session.id,
       language: session.language,
+      instanceId: RUNNER_INSTANCE_ID,
       websocketPath: `${WS_PATH}?sessionId=${session.id}`,
     });
   } catch (error) {
@@ -1285,6 +1293,22 @@ const wss = new WebSocketServer({ server, path: WS_PATH });
 
 function attachSocketToSession(ws, sessionId) {
   const session = sessions.get(sessionId);
+  if (ws.expectedInstanceId && ws.expectedInstanceId !== RUNNER_INSTANCE_ID) {
+    sendWebSocket(ws, {
+      type: "error",
+      error:
+        "Runner session was created on a different Railway instance. Keep Railway at 1 replica or move sessions to shared storage.",
+    });
+    try {
+      ws.close(
+        1008,
+        "Runner session was created on a different Railway instance",
+      );
+    } catch (_error) {
+      ws.terminate();
+    }
+    return false;
+  }
   if (!session) {
     sendWebSocket(ws, { type: "error", error: "Session not found" });
     try {
@@ -1323,6 +1347,7 @@ wss.on("connection", (ws, req) => {
 
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const initialSessionId = url.searchParams.get("sessionId");
+  ws.expectedInstanceId = String(url.searchParams.get("instanceId") || "").trim();
   ws.authType = auth.type;
   ws.authSessionId = auth.token?.sessionId || "";
   if (initialSessionId) {
