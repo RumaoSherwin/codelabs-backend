@@ -445,6 +445,7 @@ function detectCommand(candidates) {
 
 const PYTHON_COMMAND = detectPythonCommand();
 const NODE_COMMAND = process.execPath;
+const STDBUF_COMMAND = detectCommand(["stdbuf"]);
 const GCC_COMMAND = detectCommand(["gcc"]);
 const GPP_COMMAND = detectCommand(["g++"]);
 const GO_COMMAND = detectCommand(["go"]);
@@ -757,7 +758,11 @@ async function createRunWorkspace(session) {
 }
 
 function spawnInteractiveChild(command, args, options = {}) {
-  return spawn(command, args, {
+  const useUnbufferedWrapper = options.unbuffered !== false && STDBUF_COMMAND;
+  const finalCommand = useUnbufferedWrapper ? STDBUF_COMMAND : command;
+  const finalArgs = useUnbufferedWrapper ? ["-o0", "-e0", command, ...args] : args;
+
+  return spawn(finalCommand, finalArgs, {
     cwd: options.cwd,
     env: options.env ? { ...process.env, ...options.env } : process.env,
     windowsHide: true,
